@@ -1698,6 +1698,9 @@ window.closeModal = function(id) {
         const modal = document.getElementById(id);
         if (modal) modal.remove();
     }
+    if (id === 'pdf-score-import-modal' && typeof renderLayout === 'function') {
+        renderLayout();
+    }
 };
 
 function renderLayout() {
@@ -11727,6 +11730,175 @@ window.parseExcelToDailySchedule = function(rows) {
             };
         }
 
+        window.hasActualSubjectScore = function(rec) {
+            if (!rec || typeof rec !== 'object') return false;
+            const checkSem = (sem) => sem && [sem.tx1, sem.tx2, sem.tx3, sem.tx4, sem.gk, sem.ck, sem.tbm].some(v => v !== null && v !== undefined && v !== '');
+            const checkCn = (cn) => cn && cn.tbm !== null && cn.tbm !== undefined && cn.tbm !== '';
+            return Boolean(checkSem(rec.hk1) || checkSem(rec.hk2) || checkCn(rec.cn));
+        };
+
+        window.hasAnyActualStudentScores = function(academicScores) {
+            if (!academicScores || typeof academicScores !== 'object') return false;
+            return ACADEMIC_SUBJECTS.some(subj => window.hasActualSubjectScore(academicScores[subj.id]));
+        };
+
+        const GRADES_BACKUP_STORAGE_KEY = 'classManagerAcademicScores_11D';
+
+        window.persistAcademicScoresBackup = function(isDeleteAction = false) {
+            try {
+                const now = Date.now();
+                state.__gradesUpdatedAt = now;
+                state.__updatedAt = now;
+                if (isDeleteAction) {
+                    state.__gradesClearedAt = now;
+                }
+                const byName = {};
+                (state.students || []).forEach(stu => {
+                    if (!stu || !stu.name) return;
+                    const key = stripVnAccents(stu.name);
+                    if (stu.academicScores) {
+                        byName[key] = stu.academicScores;
+                    }
+                });
+                localStorage.setItem(GRADES_BACKUP_STORAGE_KEY, JSON.stringify({
+                    updatedAt: now,
+                    clearedAt: state.__gradesClearedAt || 0,
+                    gradeSelectedSubject: state.gradeSelectedSubject || 'toan',
+                    byName
+                }));
+            } catch (e) {}
+        };
+
+        window.restoreAcademicScoresBackup = function(remoteClearedAt = 0) {
+            try {
+                const raw = localStorage.getItem(GRADES_BACKUP_STORAGE_KEY);
+                if (!raw) return false;
+                const backup = JSON.parse(raw);
+                if (!backup || !backup.byName) return false;
+                const localUpdatedAt = Number(backup.updatedAt) || 0;
+                const effectiveClearedAt = Math.max(Number(backup.clearedAt) || 0, Number(remoteClearedAt) || 0);
+                if (effectiveClearedAt > localUpdatedAt) return false;
+
+                let restoredAny = false;
+                (state.students || []).forEach(stu => {
+                    if (!stu || !stu.name) return;
+                    ensureStudentAcademicScores(stu);
+                    const key = stripVnAccents(stu.name);
+                    const savedScores = backup.byName[key];
+                    if (!savedScores) return;
+                    ACADEMIC_SUBJECTS.forEach(subj => {
+                        const savedSubj = savedScores[subj.id];
+                        const curSubj = stu.academicScores[subj.id];
+                        if (window.hasActualSubjectScore(savedSubj) && !window.hasActualSubjectScore(curSubj)) {
+                            stu.academicScores[subj.id] = JSON.parse(JSON.stringify(savedSubj));
+                            restoredAny = true;
+                        }
+                    });
+                });
+                return restoredAny;
+            } catch (e) {
+                return false;
+            }
+        };
+
+        window.applyGradeSectionsToStudents = function(sections, options = {}) {
+            if (!Array.isArray(sections) || sections.length === 0) return { appliedSubjects: 0, totalStudentUpdates: 0 };
+            const st = window.__pdfImportState || {};
+            if (st.autoAddMissingStudents !== false) {
+                const current = state.students || [];
+                const isDefaultDummy = current.length <= 3 && current.every(s => ['NGUYEN VAN A', 'TRAN THI B', 'LE HOANG C'].includes(stripVnAccents(s.name)));
+                if (isDefaultDummy && typeof window.syncClass11DRosterFromPdf === 'function') {
+                    window.syncClass11DRosterFromPdf(true);
+                }
+            }
+            let appliedSubjects = 0;
+            let totalStudentUpdates = 0;
+            let firstAppliedSubjId = null;
+            let nextId = (state.students && state.students.length > 0) ? Math.max(...state.students.map(s => Number(s.id) || 0)) + 1 : 1;
+            const groupNames = (state.groups && state.groups.length > 0) ? state.groups.map(g => g.name) : ['Tổ 1', 'Tổ 2', 'Tổ 3', 'Tổ 4'];
+
+            sections.forEach(sec => {
+                const subjId = (options.forceSubjectId && sections.length === 1) ? options.forceSubjectId : (sec.subjectId || detectSubjectIdFromText(sec.subjectRaw) || st.targetSubjectId || 'toan');
+                if (!subjId || !ACADEMIC_SUBJECTS.some(s => s.id === subjId)) return;
+                if (!firstAppliedSubjId) firstAppliedSubjId = subjId;
+                const sem = (options.forceSemester && sections.length === 1) ? options.forceSemester : (sec.semester || st.targetSemester || 'hk1');
+
+                (sec.rows || []).forEach((row, idx) => {
+                    const normName = stripVnAccents(row.name);
+                    if (!normName) return;
+                    const isoDob = convertDobFormatToIso(row.dob);
+                    let student = (state.students || []).find(s => stripVnAccents(s.name) === normName && (!row.dob || !s.dob || convertIsoToDobDisplay(s.dob) === row.dob));
+                    if (!student) {
+                        student = (state.students || []).find(s => stripVnAccents(s.name) === normName);
+                    }
+                    if (!student && st.autoAddMissingStudents !== false) {
+                        const groupName = groupNames[Math.floor(idx / Math.ceil(Math.max(1, sec.rows.length) / groupNames.length)) % groupNames.length] || 'Tổ 1';
+                        student = {
+                            id: nextId++,
+                            name: row.name,
+                            points: 100,
+                            stars: 100,
+                            group: groupName,
+                            role: '',
+                            goal: 'Học sinh Tốt',
+                            talent: '',
+                            avatarUrl: '',
+                            gender: /Thị|Hương|Hà|Hòa|My|Ngọc|Quyên|Quỳnh|Thảo|Thu|Thư|Trúc|Anh|Tâm/i.test(row.name) ? 'Nữ' : 'Nam',
+                            code: generateUniqueCode(),
+                            history: [],
+                            dob: isoDob,
+                            boardingType: 'Ngoại trú',
+                            ethnicity: 'Kinh',
+                            isUnionMember: 'Rồi',
+                            academicScores: {}
+                        };
+                        state.students.push(student);
+                    }
+                    if (!student) return;
+                    if (!student.dob && isoDob) student.dob = isoDob;
+                    ensureStudentAcademicScores(student);
+                    const rec = student.academicScores[subjId];
+                    const targetSemObj = (sem === 'hk2') ? rec.hk2 : rec.hk1;
+
+                    if (row.tx1 !== undefined) targetSemObj.tx1 = row.tx1;
+                    if (row.tx2 !== undefined) targetSemObj.tx2 = row.tx2;
+                    if (row.tx3 !== undefined) targetSemObj.tx3 = row.tx3;
+                    if (row.tx4 !== undefined) targetSemObj.tx4 = row.tx4;
+                    if (row.gk  !== undefined) targetSemObj.gk  = row.gk;
+                    if (row.ck  !== undefined) targetSemObj.ck  = row.ck;
+
+                    if (row.tbm_hk1 !== undefined) {
+                        rec.hk1.tbm = row.tbm_hk1;
+                        rec.hk1.tbmManual = row.tbm_hk1 !== null;
+                    }
+                    if (row.tbm_hk2 !== undefined) {
+                        rec.hk2.tbm = row.tbm_hk2;
+                        rec.hk2.tbmManual = row.tbm_hk2 !== null;
+                    }
+                    if (row.tbm_cn !== undefined) {
+                        rec.cn.tbm = row.tbm_cn;
+                        rec.cn.tbmManual = row.tbm_cn !== null;
+                    }
+                    totalStudentUpdates++;
+                });
+                appliedSubjects++;
+            });
+
+            if (appliedSubjects > 1) {
+                const importedIds = sections.map(sec => sec.subjectId || detectSubjectIdFromText(sec.subjectRaw)).filter(Boolean);
+                if (!state.gradeSelectedSubject || (state.gradeSelectedSubject !== 'all' && !importedIds.includes(state.gradeSelectedSubject))) {
+                    state.gradeSelectedSubject = firstAppliedSubjId || 'toan';
+                }
+            } else if (firstAppliedSubjId) {
+                state.gradeSelectedSubject = firstAppliedSubjId;
+            }
+
+            window.persistAcademicScoresBackup(false);
+            if (typeof window.saveData === 'function') window.saveData();
+            if (!options.skipRenderLayout && typeof renderLayout === 'function') renderLayout();
+            return { appliedSubjects, totalStudentUpdates, firstAppliedSubjId };
+        };
+
         window.ensureStudentAcademicScores = function(student) {
             if (!student) return;
             if (!student.academicScores || typeof student.academicScores !== 'object') {
@@ -12999,8 +13171,9 @@ window.parseExcelToDailySchedule = function(rows) {
             st.activeSectionIdx = 0;
             st.targetSubjectId = sections[0].subjectId;
             st.targetSemester = 'hk1';
+            window.applyGradeSectionsToStudents(sections);
             renderPdfScoreImportModal();
-            showToast('Đã nạp trọn bộ 9 môn học (46 HS Lớp 11D) từ mẫu Sổ điểm Google Sheets!', 'success');
+            showToast('Đã nạp và lưu trọn bộ 9 môn học (46 HS Lớp 11D) vào bảng điểm!', 'success');
         };
 
         window.importGradesFromGoogleSheetUrl = async function() {
@@ -13037,8 +13210,9 @@ window.parseExcelToDailySchedule = function(rows) {
                 st.activeSectionIdx = 0;
                 st.targetSubjectId = secs[0].subjectId || 'toan';
                 st.targetSemester = secs[0].semester || 'hk1';
+                window.applyGradeSectionsToStudents(secs);
                 renderPdfScoreImportModal();
-                showToast(`Đã đọc thành công ${secs.length} môn học từ Google Sheets!`, 'success');
+                showToast(`Đã đọc và lưu tự động ${secs.length} môn học từ Google Sheets vào bảng điểm!`, 'success');
             } catch (err) {
                 showToast('Không thể tải trực tiếp (hãy tải file .xlsx về máy rồi chọn Tải file Excel/PDF).', 'error');
             }
@@ -13086,8 +13260,10 @@ window.parseExcelToDailySchedule = function(rows) {
                 appliedSubjects++;
             });
 
-            state.gradeSelectedSubject = 'all';
+            const firstSubj = (sections[0] && (sections[0].subjectId || detectSubjectIdFromText(sections[0].subjectRaw))) || 'toan';
+            state.gradeSelectedSubject = firstSubj;
             state.currentTab = 'diem-so';
+            window.persistAcademicScoresBackup(false);
             saveData();
             closeModal('pdf-score-import-modal');
             renderLayout();
@@ -13108,6 +13284,7 @@ window.parseExcelToDailySchedule = function(rows) {
                 ACADEMIC_SUBJECTS.forEach(subj => {
                     student.academicScores[subj.id] = createEmptySubjectScoreRecord();
                 });
+                window.persistAcademicScoresBackup(true);
                 saveData();
                 if (fromModal) openStudentAcademicModal(student.id);
                 else renderLayout();
@@ -13117,6 +13294,7 @@ window.parseExcelToDailySchedule = function(rows) {
                 const subjName = subjObj ? subjObj.fullName : targetSubj;
                 if (!confirm(`Bạn có chắc chắn muốn XOÁ ĐIỂM môn ${subjName} của học sinh "${student.name}" không?`)) return;
                 student.academicScores[targetSubj] = createEmptySubjectScoreRecord();
+                window.persistAcademicScoresBackup(true);
                 saveData();
                 if (fromModal) openStudentAcademicModal(student.id);
                 else renderLayout();
@@ -13222,6 +13400,7 @@ window.parseExcelToDailySchedule = function(rows) {
                 });
                 showToast('Đã xoá sạch toàn bộ bảng điểm 9 môn của cả lớp!', 'info');
             }
+            window.persistAcademicScoresBackup(true);
             saveData();
             closeModal('delete-grades-modal');
             renderLayout();
@@ -13502,6 +13681,7 @@ window.parseExcelToDailySchedule = function(rows) {
             if (field === 'tbm_hk1') row.hasPdfTbm = (num !== null);
             if (field === 'tbm_hk2') row.hasPdfTbmHk2 = (num !== null);
             if (field === 'tbm_cn')  row.hasPdfTbmCn = (num !== null);
+            window.applyGradeSectionsToStudents([activeSec], { forceSubjectId: st.targetSubjectId, forceSemester: st.targetSemester, skipRenderLayout: true });
             renderPdfScoreImportModal();
         };
 
@@ -13544,8 +13724,9 @@ window.parseExcelToDailySchedule = function(rows) {
             if (chosen.subjectId) st.targetSubjectId = chosen.subjectId;
             if (chosen.semester) st.targetSemester = chosen.semester;
 
+            window.applyGradeSectionsToStudents(allSections);
             renderPdfScoreImportModal();
-            showToast(`Đã bóc tách ${allSections.length} bảng điểm từ file PDF!`, 'success');
+            showToast(`Đã đọc và lưu tự động ${allSections.length} bảng điểm môn học vào hệ thống!`, 'success');
         };
 
         window.fillDemoScoresIntoPdfPreview = function() {
@@ -13703,6 +13884,7 @@ window.parseExcelToDailySchedule = function(rows) {
 
             state.gradeSelectedSubject = subjId;
             state.currentTab = 'diem-so';
+            window.persistAcademicScoresBackup(false);
             saveData();
             closeModal('pdf-score-import-modal');
             renderLayout();
@@ -14630,16 +14812,27 @@ window.parseExcelToDailySchedule = function(rows) {
             } catch (e) { console.warn('Không kết nối được Firebase:', e); }
         }
 
+        // Khôi phục bảng điểm dự phòng từ localStorage ngay khi khởi động
+        if (typeof window.restoreAcademicScoresBackup === 'function') {
+            window.restoreAcademicScoresBackup(state.__gradesClearedAt || 0);
+        }
+
         const CLIENT_SESSION_ID = 'sess_' + Math.random().toString(36).slice(2) + '_' + Date.now();
         window.__lastSavedSharedJson = '';
+        window.__hasPendingLocalSave = false;
 
         window.saveData = function() {
+            state.__updatedAt = Date.now();
             const sharedJson = JSON.stringify(getSharedState());
             window.__lastSavedSharedJson = sharedJson;
             try { localStorage.setItem('classManagerData', JSON.stringify(state)); } catch (e) {}
-            if (!dbRef || !isDataLoaded) return; // chưa tải xong dữ liệu chung thì chưa ghi, tránh ghi đè
+            if (!dbRef) return;
+            if (!isDataLoaded) {
+                window.__hasPendingLocalSave = true;
+                return;
+            }
             // Lưu cả dữ liệu thành 1 chuỗi kèm clientId để khi Firebase dội ngược lại sẽ không tự vẽ lại trang
-            dbRef.set({ json: sharedJson, updatedAt: Date.now(), clientId: CLIENT_SESSION_ID })
+            dbRef.set({ json: sharedJson, updatedAt: state.__updatedAt, clientId: CLIENT_SESSION_ID })
                  .catch(err => { console.error(err); showToast('Không lưu được lên mạng, kiểm tra kết nối!', 'error'); });
         };
 
@@ -14664,27 +14857,48 @@ window.parseExcelToDailySchedule = function(rows) {
                 try { remoteState = JSON.parse(remote.json); } catch (e) { return; }
 
                 const before = JSON.stringify(getSharedState());
-                // Thay toàn bộ phần dùng chung bằng dữ liệu trên mạng, giữ nguyên phần riêng của người này
+                const localGradesUpdatedAt = Number(state.__gradesUpdatedAt) || 0;
+                const remoteGradesClearedAt = Number(remoteState.__gradesClearedAt) || 0;
                 const keep = {};
                 LOCAL_ONLY_KEYS.forEach(k => { if (k in state) keep[k] = state[k]; });
                 const localStudents = state.students || [];
+                let mergedLocalDataNeedsPush = Boolean(window.__hasPendingLocalSave);
+                window.__hasPendingLocalSave = false;
+
                 state = { ...remoteState, ...keep };
                 if (Array.isArray(state.students) && localStudents.length > 0) {
                     state.students.forEach(rs => {
-                        const ls = localStudents.find(x => x.id === rs.id || x.name === rs.name);
-                        if (ls && ls.academicScores && (!rs.academicScores || Object.keys(rs.academicScores).length === 0)) {
-                            rs.academicScores = ls.academicScores;
+                        const normRsName = stripVnAccents(rs.name);
+                        const ls = localStudents.find(x => x.id === rs.id || stripVnAccents(x.name) === normRsName);
+                        if (ls && ls.academicScores) {
+                            ensureStudentAcademicScores(rs);
+                            ACADEMIC_SUBJECTS.forEach(subj => {
+                                const lsSubj = ls.academicScores[subj.id];
+                                const rsSubj = rs.academicScores[subj.id];
+                                if (window.hasActualSubjectScore(lsSubj) && !window.hasActualSubjectScore(rsSubj) && remoteGradesClearedAt <= localGradesUpdatedAt) {
+                                    rs.academicScores[subj.id] = JSON.parse(JSON.stringify(lsSubj));
+                                    mergedLocalDataNeedsPush = true;
+                                }
+                            });
                         }
                         if (ls && ls.accountPassword && !rs.accountPassword) {
                             rs.accountPassword = ls.accountPassword;
+                            mergedLocalDataNeedsPush = true;
                         }
                         if (ls && ls.avatarUrl && !rs.avatarUrl) {
                             rs.avatarUrl = ls.avatarUrl;
+                            mergedLocalDataNeedsPush = true;
                         }
                         if (ls && ls.profileQuote && !rs.profileQuote) {
                             rs.profileQuote = ls.profileQuote;
+                            mergedLocalDataNeedsPush = true;
                         }
                     });
+                }
+                if (typeof window.restoreAcademicScoresBackup === 'function') {
+                    if (window.restoreAcademicScoresBackup(remoteGradesClearedAt)) {
+                        mergedLocalDataNeedsPush = true;
+                    }
                 }
                 applyStateDefaults();
                 if (typeof window.ensureLuuDucAnhFirst === 'function') window.ensureLuuDucAnhFirst();
@@ -14693,9 +14907,13 @@ window.parseExcelToDailySchedule = function(rows) {
                 }
                 window.__lastSavedSharedJson = JSON.stringify(getSharedState());
 
+                try { localStorage.setItem('classManagerData', JSON.stringify(state)); } catch (e) {}
+                if (mergedLocalDataNeedsPush) {
+                    window.saveData();
+                }
+
                 // Nếu không có gì thay đổi thì khỏi vẽ lại (tránh làm gián đoạn người đang gõ)
                 if (wasLoaded && before === window.__lastSavedSharedJson) return;
-                try { localStorage.setItem('classManagerData', JSON.stringify(state)); } catch (e) {}
                 // Nếu người dùng đang gõ trong ô điểm thì không render đè ngay lúc đang gõ
                 if (wasLoaded && document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA')) {
                     return;
