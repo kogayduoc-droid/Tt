@@ -11730,11 +11730,23 @@ window.parseExcelToDailySchedule = function(rows) {
             };
         }
 
+        window.countSubjectScoreFields = function(rec) {
+            if (!rec || typeof rec !== 'object') return 0;
+            let cnt = 0;
+            const countSem = (sem) => {
+                if (!sem) return;
+                ['tx1', 'tx2', 'tx3', 'tx4', 'gk', 'ck', 'tbm'].forEach(k => {
+                    if (sem[k] !== null && sem[k] !== undefined && sem[k] !== '') cnt++;
+                });
+            };
+            countSem(rec.hk1);
+            countSem(rec.hk2);
+            if (rec.cn && rec.cn.tbm !== null && rec.cn.tbm !== undefined && rec.cn.tbm !== '') cnt++;
+            return cnt;
+        };
+
         window.hasActualSubjectScore = function(rec) {
-            if (!rec || typeof rec !== 'object') return false;
-            const checkSem = (sem) => sem && [sem.tx1, sem.tx2, sem.tx3, sem.tx4, sem.gk, sem.ck, sem.tbm].some(v => v !== null && v !== undefined && v !== '');
-            const checkCn = (cn) => cn && cn.tbm !== null && cn.tbm !== undefined && cn.tbm !== '';
-            return Boolean(checkSem(rec.hk1) || checkSem(rec.hk2) || checkCn(rec.cn));
+            return window.countSubjectScoreFields(rec) > 0;
         };
 
         window.hasAnyActualStudentScores = function(academicScores) {
@@ -11789,8 +11801,9 @@ window.parseExcelToDailySchedule = function(rows) {
                     ACADEMIC_SUBJECTS.forEach(subj => {
                         const savedSubj = savedScores[subj.id];
                         const curSubj = stu.academicScores[subj.id];
-                        if (window.hasActualSubjectScore(savedSubj) && !window.hasActualSubjectScore(curSubj)) {
+                        if (window.countSubjectScoreFields(savedSubj) > window.countSubjectScoreFields(curSubj)) {
                             stu.academicScores[subj.id] = JSON.parse(JSON.stringify(savedSubj));
+                            ensureStudentAcademicScores(stu);
                             restoredAny = true;
                         }
                     });
@@ -11912,6 +11925,15 @@ window.parseExcelToDailySchedule = function(rows) {
                     if (!rec.hk1) rec.hk1 = { tx1: null, tx2: null, tx3: null, tx4: null, gk: null, ck: null, tbm: null, tbmManual: false };
                     if (!rec.hk2) rec.hk2 = { tx1: null, tx2: null, tx3: null, tx4: null, gk: null, ck: null, tbm: null, tbmManual: false };
                     if (!rec.cn)  rec.cn  = { tbm: null, tbmManual: false };
+                    // Tự động khôi phục nếu điểm thành phần TX1..TX4, GK, CK của HK1 bị đặt nhầm sang HK2 (khi HK1 có ĐTBmhk1 nhưng HK2 chưa có ĐTBmhk2)
+                    const hk1CompEmpty = [rec.hk1.tx1, rec.hk1.tx2, rec.hk1.tx3, rec.hk1.tx4, rec.hk1.gk, rec.hk1.ck].every(v => v === null || v === undefined);
+                    const hk2CompHas = [rec.hk2.tx1, rec.hk2.tx2, rec.hk2.tx3, rec.hk2.tx4, rec.hk2.gk, rec.hk2.ck].some(v => v !== null && v !== undefined);
+                    if (hk1CompEmpty && hk2CompHas && rec.hk2.tbm === null && rec.hk1.tbm !== null) {
+                        ['tx1', 'tx2', 'tx3', 'tx4', 'gk', 'ck'].forEach(f => {
+                            rec.hk1[f] = rec.hk2[f];
+                            rec.hk2[f] = null;
+                        });
+                    }
                 }
             });
         };
@@ -12516,15 +12538,15 @@ window.parseExcelToDailySchedule = function(rows) {
                 let subjectRaw = '';
                 let semesterRaw = '';
 
-                // 2. Nhận diện thông tin Lớp, Môn, Học kỳ từ phần tiêu đề đầu trang hoặc tiêu đề cột (ĐTBmhk1 / ĐTBmhk2 / ĐTBmcn)
-                for (const r of allRows.slice(0, 15)) {
+                // 2. Nhận diện thông tin Lớp, Môn, Học kỳ từ phần tiêu đề đầu trang
+                for (const r of allRows.slice(0, 10)) {
                     const lineText = r.cells.map(c => c.text).join(' ');
                     const lm = /LỚP:\s*([0-9]{1,2}[A-Z]\d*)/i.exec(lineText);
                     if (lm) className = lm[1].toUpperCase();
-                    const mm = /MÔN(?:\s*HỌC)?:\s*(.+?)(?=\s+HỌC\s*K[ÌỲ]|\s+CẢ\s*NĂM|\s+NĂM\s*HỌC|$)/i.exec(lineText);
-                    if (mm && !subjectRaw) subjectRaw = mm[1].trim();
-                    if (/HỌC\s*K[ÌỲ]\s*(?:II|2)\b|HK\s*(?:II|2)\b|ĐTBmhk(?:2|II)\b|TBMHK(?:2|II)\b/i.test(lineText)) semesterRaw = 'hk2';
-                    else if (/HỌC\s*K[ÌỲ]\s*(?:I|1)\b|HK\s*(?:I|1)\b|ĐTBmhk(?:1|I)\b|TBMHK(?:1|I)\b/i.test(lineText) && !semesterRaw) semesterRaw = 'hk1';
+                    const mm = /MÔN(?:\s*HỌC)?:\s*(.+?)(?=\s+HỌC\s*K[ÌỲ]|\s+CẢ\s*NĂM|\s+NĂM\s*HỌC|\s+ĐĐG|$)/i.exec(lineText);
+                    if (mm && !subjectRaw) subjectRaw = mm[1].replace(/\s*-\s*$/, '').trim();
+                    if (/HỌC\s*K[ÌỲ]\s*(?:II|2)\b|\bHK\s*(?:II|2)\b/i.test(lineText)) semesterRaw = 'hk2';
+                    else if (/HỌC\s*K[ÌỲ]\s*(?:I|1)\b|\bHK\s*(?:I|1)\b/i.test(lineText) && !semesterRaw) semesterRaw = 'hk1';
                     else if (/CẢ\s*NĂM/i.test(lineText) && !semesterRaw) semesterRaw = 'cn';
                 }
 
@@ -12535,7 +12557,7 @@ window.parseExcelToDailySchedule = function(rows) {
                 const normCell = txt => stripVnAccents(txt).replace(/[^A-Z0-9]/g, '');
 
                 const sttHeader = allFlatCells.find(c => /^(STT|TT|SOTT)$/.test(normCell(c.text)));
-                const nameHeader = allFlatCells.find(c => /HOVATEN|HOTEN/.test(normCell(c.text)));
+                const nameHeader = allFlatCells.find(c => /^(HOVATEN|HOTEN|TENHOCSINH|HOVATENHS)$/.test(normCell(c.text)));
                 const gkHeader = allFlatCells.find(c => /^(DDGGK|DGK|GK|GIUAKI|GIUAKY|DIEMGK)$/.test(normCell(c.text)));
                 const ckHeader = allFlatCells.find(c => /^(DDGCK|DCK|CK|CUOIKI|CUOIKY|DIEMCK)$/.test(normCell(c.text)));
                 const mhkHeader = allFlatCells.find(c => /^(DTBMHK1|DTBMHK2|DTBMHKI|DTBMHKII|DTBMHK|DTBM|TBMHK1|TBMHK2|TBM|TBMON|MHK1|MHK2|MHKI|MHKII|MHK|DTB)$/.test(normCell(c.text)));
@@ -12973,11 +12995,27 @@ window.parseExcelToDailySchedule = function(rows) {
             let subjectRaw = '';
             let semesterRaw = '';
 
-            // 1. Lấy thông tin Lớp, Môn học, Học kỳ từ 15 dòng đầu hoặc từ tên Sheet (VD: "11D Toan", "Môn học: TOÁN - ")
+
+
+            // 1. Tìm dòng tiêu đề bảng (chứa STT và Họ và tên) trước
+            let headerRowIdx = -1;
+            for (let r = 0; r < Math.min(18, aoaRows.length); r++) {
+                const row = aoaRows[r] || [];
+                const norms = row.map(normCell);
+                const hasStt = norms.some(c => /^(STT|TT|SOTT)$/.test(c));
+                const hasName = norms.some(c => /^(HOVATEN|HOTEN|TENHOCSINH|HOVATENHS)$/.test(c));
+                if (hasStt && hasName) {
+                    headerRowIdx = r;
+                    break;
+                }
+            }
+            if (headerRowIdx === -1) return null;
+
+            // 2. Lấy thông tin Lớp, Môn học, Học kỳ từ các dòng PHÍA TRÊN dòng tiêu đề bảng (không quét dòng tiêu đề chứa ĐTBmhk2!)
             const sheetClassMatch = /\b([0-9]{1,2}[A-Z]\d*)\b/i.exec(sheetName);
             if (sheetClassMatch) className = sheetClassMatch[1].toUpperCase();
 
-            for (let r = 0; r < Math.min(15, aoaRows.length); r++) {
+            for (let r = 0; r < headerRowIdx; r++) {
                 const row = aoaRows[r] || [];
                 const lineText = row.filter(x => x !== null && x !== undefined && String(x).trim() !== '').join(' ');
                 if (!lineText) continue;
@@ -12987,28 +13025,14 @@ window.parseExcelToDailySchedule = function(rows) {
                 if (mm && !subjectRaw) {
                     subjectRaw = mm[1].replace(/\s*-\s*$/, '').trim();
                 }
-                if (/HỌC\s*K[ÌỲ]\s*(?:II|2)\b|HK\s*(?:II|2)\b/i.test(lineText)) semesterRaw = 'hk2';
-                else if (/HỌC\s*K[ÌỲ]\s*(?:I|1)\b|HK\s*(?:I|1)\b/i.test(lineText) && !semesterRaw) semesterRaw = 'hk1';
+                if (/HỌC\s*K[ÌỲ]\s*(?:II|2)\b|\bHK\s*(?:II|2)\b/i.test(lineText)) semesterRaw = 'hk2';
+                else if (/HỌC\s*K[ÌỲ]\s*(?:I|1)\b|\bHK\s*(?:I|1)\b/i.test(lineText) && !semesterRaw) semesterRaw = 'hk1';
                 else if (/CẢ\s*NĂM/i.test(lineText) && !semesterRaw) semesterRaw = 'cn';
             }
 
             if (!subjectRaw && sheetName) {
                 subjectRaw = sheetName.replace(/^\s*[0-9]{1,2}[A-Z]\d*\s*/i, '').trim() || sheetName;
             }
-
-            // 2. Tìm dòng tiêu đề bảng (chứa STT và Họ và tên)
-            let headerRowIdx = -1;
-            for (let r = 0; r < Math.min(18, aoaRows.length); r++) {
-                const row = aoaRows[r] || [];
-                const norms = row.map(normCell);
-                const hasStt = norms.some(c => /^(STT|TT|SOTT)$/.test(c));
-                const hasName = norms.some(c => /HOVATEN|HOTEN/.test(c));
-                if (hasStt && hasName) {
-                    headerRowIdx = r;
-                    break;
-                }
-            }
-            if (headerRowIdx === -1) return null;
 
             const hRow = aoaRows[headerRowIdx] || [];
             const subRow = aoaRows[headerRowIdx + 1] || [];
@@ -13098,6 +13122,14 @@ window.parseExcelToDailySchedule = function(rows) {
             if (!detectedSubjId && parsedRows.every(r => [r.tx1, r.tx2, r.tx3, r.tx4, r.gk, r.ck, r.tbm_hk1, r.tbm_hk2, r.tbm_cn].every(v => v === null))) {
                 // Bỏ qua các sheet môn nhận xét trống (như GDTC, HĐTN, GDĐP không có điểm số)
                 return null;
+            }
+
+            const hasAnyHk1Tbm = parsedRows.some(r => r.tbm_hk1 !== null);
+            const hasAnyHk2Tbm = parsedRows.some(r => r.tbm_hk2 !== null);
+            if (!semesterRaw) {
+                semesterRaw = (hasAnyHk2Tbm && !hasAnyHk1Tbm) ? 'hk2' : 'hk1';
+            } else if (semesterRaw === 'hk2' && hasAnyHk1Tbm && !hasAnyHk2Tbm) {
+                semesterRaw = 'hk1';
             }
 
             return {
@@ -14875,8 +14907,9 @@ window.parseExcelToDailySchedule = function(rows) {
                             ACADEMIC_SUBJECTS.forEach(subj => {
                                 const lsSubj = ls.academicScores[subj.id];
                                 const rsSubj = rs.academicScores[subj.id];
-                                if (window.hasActualSubjectScore(lsSubj) && !window.hasActualSubjectScore(rsSubj) && remoteGradesClearedAt <= localGradesUpdatedAt) {
+                                if (window.countSubjectScoreFields(lsSubj) > window.countSubjectScoreFields(rsSubj) && remoteGradesClearedAt <= localGradesUpdatedAt) {
                                     rs.academicScores[subj.id] = JSON.parse(JSON.stringify(lsSubj));
+                                    ensureStudentAcademicScores(rs);
                                     mergedLocalDataNeedsPush = true;
                                 }
                             });
